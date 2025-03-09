@@ -6,16 +6,15 @@ import shutil
 import time
 import threading
 import os
+from opcua import Server
 
 app = Flask(__name__)
-app.secret_key = "supersecretkey"
+app.secret_key = secrets.token_hex(32)
+# app.secret_key = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
 
 # Configure logging
 logging.basicConfig(filename='warehouse_log.log', level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Siemens PLC OPC UA Configuration
-PLC_OPC_UA_URL = "opc.tcp://192.168.0.1:4840"  # Update with your Siemens PLC IP
 
 # Ensure backup directory exists
 BACKUP_DIR = "backups"
@@ -36,6 +35,83 @@ def schedule_backup():
 # Start the backup thread
 database_backup_thread = threading.Thread(target=schedule_backup, daemon=True)
 database_backup_thread.start()
+
+
+# Initialize OPC UA Server
+opcua_server = Server()
+opcua_server.set_endpoint("opc.tcp://0.0.0.0:4840")  # Allow connections from any client
+opcua_namespace = opcua_server.register_namespace("Warehouse")
+
+# Create an OPC UA object for warehouse management
+warehouse_obj = opcua_server.nodes.objects.add_object(opcua_namespace, "Warehouse")
+
+# Create variables for inventory management
+item_count = warehouse_obj.add_variable(opcua_namespace, "ItemCount", 0)
+traffic_light_status = warehouse_obj.add_variable(opcua_namespace, "TrafficLightStatus", "OFF")
+HMI_command = warehouse_obj.add_variable(opcua_namespace, "HMICommand", "NONE")
+HMI_status = warehouse_obj.add_variable(opcua_namespace, "HMIStatus", "IDLE")
+
+# Define possible HMI commands
+HMI_COMMANDS = ["START", "STOP", "RESET", "EMERGENCY_STOP", "LOAD", "UNLOAD", "MAINTENANCE_MODE"]
+
+# Allow PLC and HMI clients to modify these variables
+item_count.set_writable()
+traffic_light_status.set_writable()
+HMI_command.set_writable()
+HMI_status.set_writable()
+
+# Start OPC UA server in a separate thread
+def start_opcua_server():
+    opcua_server.start()
+    logging.info("OPC UA Server started at opc.tcp://0.0.0.0:4840")
+
+t = threading.Thread(target=start_opcua_server, daemon=True)
+t.start()
+
+# API route to get item count from OPC UA
+@app.route("/opcua/get-item-count", methods=["GET"])
+def get_item_count():
+    return jsonify({"item_count": item_count.get_value()})
+
+# API route to set item count from OPC UA
+@app.route("/opcua/set-item-count", methods=["POST"])
+def set_item_count():
+    data = request.json
+    new_count = data.get("item_count")
+    if isinstance(new_count, int):
+        item_count.set_value(new_count)
+        return jsonify({"message": "Item count updated successfully"})
+    return jsonify({"error": "Invalid item count"}), 400
+
+# API route to get traffic light status from OPC UA
+@app.route("/opcua/get-traffic-light", methods=["GET"])
+def get_traffic_light_status():
+    return jsonify({"traffic_light_status": traffic_light_status.get_value()})
+
+# API route to set traffic light status from OPC UA
+@app.route("/opcua/set-traffic-light", methods=["POST"])
+def set_traffic_light_status():
+    data = request.json
+    new_status = data.get("traffic_light_status")
+    if new_status in ["RED", "YELLOW", "GREEN", "OFF"]:
+        traffic_light_status.set_value(new_status)
+        return jsonify({"message": "Traffic light status updated successfully"})
+    return jsonify({"error": "Invalid status"}), 400
+
+# API route to get HMI status
+@app.route("/opcua/get-hmi-status", methods=["GET"])
+def get_hmi_status():
+    return jsonify({"hmi_status": HMI_status.get_value()})
+
+# API route to set HMI command
+@app.route("/opcua/set-hmi-command", methods=["POST"])
+def set_hmi_command():
+    data = request.json
+    new_command = data.get("hmi_command")
+    if isinstance(new_command, str) and new_command in HMI_COMMANDS:
+        HMI_command.set_value(new_command)
+        return jsonify({"message": "HMI command updated successfully"})
+    return jsonify({"error": "Invalid HMI command"}), 400
 
 # API route to trigger manual backup
 @app.route("/backup-now", methods=["POST"])
