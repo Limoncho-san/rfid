@@ -1,25 +1,272 @@
 from flask import Flask, render_template, request, jsonify, redirect, url_for, session
 import sqlite3
 import opcua
-import rfid_reader
+import logging
+import shutil
+import time
+import threading
+import os
 
 app = Flask(__name__)
 app.secret_key = "supersecretkey"
-
-def get_db_connection():
-    conn = sqlite3.connect("database.db")
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 
 # Configure logging
 logging.basicConfig(filename='warehouse_log.log', level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Siemens PLC OPC UA Configuration
+PLC_OPC_UA_URL = "opc.tcp://192.168.0.1:4840"  # Update with your Siemens PLC IP
+
+# Ensure backup directory exists
+BACKUP_DIR = "backups"
+os.makedirs(BACKUP_DIR, exist_ok=True)
+
+# Function to backup the database
+def backup_database():
+    backup_file = os.path.join(BACKUP_DIR, f"backup_{time.strftime('%Y%m%d%H%M%S')}.db")
+    shutil.copy("database.db", backup_file)
+    logging.info(f"Database backup created: {backup_file}")
+
+# Function to schedule automatic database backups every 24 hours
+def schedule_backup():
+    while True:
+        time.sleep(86400)  # 24 hours in seconds
+        backup_database()
+
+# Start the backup thread
+database_backup_thread = threading.Thread(target=schedule_backup, daemon=True)
+database_backup_thread.start()
+
+# API route to trigger manual backup
+@app.route("/backup-now", methods=["POST"])
+def manual_backup():
+    backup_database()
+    return jsonify({"message": "Manual database backup completed successfully."})
+
+# Function to connect to SQLite database
+def get_db_connection():
+    conn = sqlite3.connect("database.db")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# Function to initialize the database
+def initialize_database():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Create users table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            rfid_tag TEXT UNIQUE NOT NULL
+        )
+    ''')
+    
+    # Create roles table for user permissions
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS roles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role_name TEXT UNIQUE NOT NULL
+        )
+    ''')
+    
+    # Create user roles mapping table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_roles (
+            user_id INTEGER,
+            role_id INTEGER,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (role_id) REFERENCES roles(id),
+            PRIMARY KEY (user_id, role_id)
+        )
+    ''')
+    
+    # Create categories table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            description TEXT
+        )
+    ''')
+    
+    # Create products table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            barcode TEXT UNIQUE NOT NULL,
+            category_id INTEGER,
+            rfid_tag TEXT UNIQUE NOT NULL,
+            FOREIGN KEY (category_id) REFERENCES categories(id)
+        )
+    ''')
+    
+    # Create cabinets table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS cabinets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL
+        )
+    ''')
+    
+    # Create shelves table (linked to cabinets)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS shelves (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cabinet_id INTEGER,
+            name TEXT NOT NULL,
+            allows_multiple_categories BOOLEAN DEFAULT FALSE,
+            FOREIGN KEY (cabinet_id) REFERENCES cabinets(id)
+        )
+    ''')
+    
+    # Create shelf categories (for multiple categories in a shelf)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS shelf_categories (
+            shelf_id INTEGER,
+            category_id INTEGER,
+            FOREIGN KEY (shelf_id) REFERENCES shelves(id),
+            FOREIGN KEY (category_id) REFERENCES categories(id),
+            PRIMARY KEY (shelf_id, category_id)
+        )
+    ''')
+    
+    # Create transactions table (logs all stock movements)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            user_id INTEGER,
+            product_id INTEGER,
+            quantity INTEGER,
+            transaction_type TEXT CHECK( transaction_type IN ('load', 'get') ),
+            shelf_id INTEGER,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (product_id) REFERENCES products(id),
+            FOREIGN KEY (shelf_id) REFERENCES shelves(id)
+        )
+    ''')
+    
+    # Create URFID tracking table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS urfid_tracking (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            rfid_tag TEXT UNIQUE NOT NULL,
+            product_id INTEGER,
+            shelf_id INTEGER,
+            status TEXT CHECK( status IN ('added', 'removed', 'moved') ),
+            FOREIGN KEY (product_id) REFERENCES products(id),
+            FOREIGN KEY (shelf_id) REFERENCES shelves(id)
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+    logging.info("Database initialized successfully.")
+
+# Initialize the database on startup
+initialize_database()
+
+# Route to manually reset the database
+@app.route("/reset-database", methods=["POST"])
+def reset_db_route():
+    initialize_database()
+    return jsonify({"message": "Database has been reset and reinitialized."})
+
+
+# Function to connect to Siemens PLC with retry logic
+def connect_opcua(retries=3, delay=2):
+    for attempt in range(retries):
+        try:
+            client = opcua.Client(PLC_OPC_UA_URL)
+            client.connect()
+            logging.info("Connected to Siemens PLC OPC UA server.")
+            return client
+        except Exception as e:
+            logging.error(f"Attempt {attempt + 1}: Failed to connect to Siemens PLC: {str(e)}")
+            time.sleep(delay)
+    return None
+
+# Function to check PLC connection
+def check_plc_connection():
+    client = connect_opcua()
+    if client:
+        client.disconnect()
+        return {"status": "Connected"}
+    return {"status": "Disconnected", "error": "Cannot connect to Siemens PLC"}
+
+# --------- PLC Connection Health Check Route ---------
+@app.route("/opcua/status", methods=["GET"])
+def opcua_status():
+    return jsonify(check_plc_connection())
+
+# Function to read value from PLC
+
+def read_plc_value(node_id):
+    client = connect_opcua()
+    if not client:
+        return {"error": "Cannot connect to Siemens PLC"}
+    try:
+        node = client.get_node(node_id)
+        value = node.get_value()
+        client.disconnect()
+        logging.info(f"Read from PLC - Node: {node_id}, Value: {value}")
+        return value
+    except Exception as e:
+        logging.error(f"Failed to read PLC node {node_id}: {str(e)}")
+        return {"error": str(e)}
+
+# Function to write value to PLC
+
+def write_plc_value(node_id, value):
+    client = connect_opcua()
+    if not client:
+        return {"error": "Cannot connect to Siemens PLC"}
+    try:
+        node = client.get_node(node_id)
+        node.set_value(value)
+        client.disconnect()
+        logging.info(f"Write to PLC - Node: {node_id}, Value: {value}")
+        return {"message": "Value written successfully"}
+    except Exception as e:
+        logging.error(f"Failed to write PLC node {node_id}: {str(e)}")
+        return {"error": str(e)}
+
+# --------- Traffic Light Control for Siemens PLC ---------
+@app.route("/traffic-light", methods=["POST"])
+def traffic_light_control():
+    data = request.json
+    cabinet_id = data.get("cabinet_id")
+    status = data.get("status")  # green, yellow, red
+    node_id = f"ns=2;s=TrafficLight_{cabinet_id}"
+    return write_plc_value(node_id, status)
+
+# --------- OPC UA Read and Write Routes ---------
+@app.route("/opcua/read", methods=["POST"])
+def opcua_read():
+    data = request.json
+    node_id = data.get("node_id")
+    return jsonify({"value": read_plc_value(node_id)})
+
+@app.route("/opcua/write", methods=["POST"])
+def opcua_write():
+    data = request.json
+    node_id = data.get("node_id")
+    value = data.get("value")
+    return jsonify(write_plc_value(node_id, value))
+
+
 # --------- OPC UA Communication Logging ---------
-def opcua_log(node_id, value, status):
-    logging.info(f"OPC UA Update - Node: {node_id}, Value: {value}, Status: {status}")
+def opcua_log(node_id, value, status, error=None):
+    if error:
+        logging.error(f"OPC UA Failed - Node: {node_id}, Value: {value}, Status: {status}, Error: {error}")
+    else:
+        logging.info(f"OPC UA Update - Node: {node_id}, Value: {value}, Status: {status}")
+
 
 
 # --------- Error Alerting ---------
@@ -127,17 +374,21 @@ def traffic_light_control():
 def load_items():
     data = request.json
     rfid_tag = data.get("rfid_tag")
-    item_id = data.get("item_id")
     quantity = data.get("quantity")
+    
     conn = get_db_connection()
-    user = conn.execute("SELECT * FROM users WHERE rfid_tag = ?", (rfid_tag,)).fetchone()
-    if not user:
+    product = conn.execute("SELECT id FROM products WHERE rfid_tag = ?", (rfid_tag,)).fetchone()
+    
+    if not product:
         conn.close()
-        return jsonify({"error": "Unauthorized RFID"}), 401
-    conn.execute("UPDATE products SET quantity = quantity + ? WHERE id = ?", (quantity, item_id))
+        return jsonify({"error": "RFID tag not found"}), 404  # Грешка, ако частта не е намерена
+    
+    conn.execute("UPDATE products SET quantity = quantity + ? WHERE id = ?", (quantity, product["id"]))
     conn.commit()
     conn.close()
+    
     return jsonify({"message": "Item loaded successfully"})
+
 
 @app.route("/get", methods=["POST"])
 def get_items():
@@ -165,7 +416,11 @@ def opcua_update():
     data = request.json
     node_id = data.get("node_id")
     value = data.get("value")
-    client = opcua.Client("opc.tcp://localhost:4840")
+
+    if not node_id or not value:
+        return jsonify({"error": "Invalid node_id or value"}), 400  # Грешка ако липсват данни
+
+    client = opcua.Client(PLC_OPC_UA_URL)
     try:
         client.connect()
         node = client.get_node(node_id)
@@ -177,14 +432,7 @@ def opcua_update():
         opcua_log(node_id, value, f"Failed: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
+
+
 if __name__ == "__main__":
     app.run(debug=True)
-
-
-
-
-
-
-
-
-
